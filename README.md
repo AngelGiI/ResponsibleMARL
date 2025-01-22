@@ -39,6 +39,16 @@ python test.py -n=[experiment_name] -a=[agent]
 # Example
 python test.py -n=case_5 -a='ppo' -s=0 -c=5 
 ```
+#### New addition
+New arguments for Responsibility areas include:
+```sh
+ -nc: "Number of clusters"
+ -cm: "Clustering method"
+ -am: "Adjacency matrix"
+
+# Example
+python test.py -n=case_5 -a='ppo' -s=0 -c=5 -nc=2 -cm="hierarchical" -am="congestion"
+```
 
 ### Evaluate
 With `evaluate.py` you can evaluate the trained agent on a different set of chronics.
