@@ -127,7 +127,6 @@ class BasePPO(MyBaseAgent):
         )
         self.actor.to(self.device)
         self.critic.to(self.device)
-
         self.new_critic, self.new_actor = create_critic_actor(
             self.input_dim,
             self.state_dim,
@@ -189,7 +188,7 @@ class BasePPO(MyBaseAgent):
         else:
             return action_probs.argmax()  # TODO: use top N actions with prob
         
-            # Alternative: use top N actions in recursion until a "relevant" action is found.
+            # Alternative: use top N actions in recursion until a "relevant" action is found or dn_count reached limit.
             sorted_actions = action_probs.argsort(descending=True)
             return sorted_actions[0][dn_count]
 

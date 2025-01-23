@@ -3,7 +3,7 @@ import optuna
 
 
 def sample_params(trial: optuna.Trial, agent_name) -> Dict[str, Any]:
-    if agent_name == 'ppo':
+    if agent_name == 'ppo' or "ippo" in agent_name:
         sampled_hyperparams = sample_ppo_params(trial)
     elif agent_name == 'dppo':
         sampled_hyperparams = sample_dppo_params(trial)

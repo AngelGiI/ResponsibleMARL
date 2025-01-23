@@ -9,6 +9,8 @@ import pandas as pd
 import matplotlib.colors as mcolors
 from collections import defaultdict
 from statistics import mean, stdev
+import re
+from scipy import stats
 
 colors = [i for i in mcolors.TABLEAU_COLORS.keys()]
 
@@ -161,13 +163,14 @@ def compare_results(
     ymax=105,
     ylabel="mean score",
     title="Training Scores",
+    window_size=10,  # Add window size parameter for smoothing
+    max_colors=10  # Add max colors parameter
 ):
     """
     With this function you can plot the results of multiple different agents.
 
     Parameters
     ----------
-
     cases: ``list``
         A list of strings that will represent the labels in the plot.
     list_data_frames: ``list``
@@ -177,35 +180,198 @@ def compare_results(
         If you use
         import scienceplots
         you can create nice and clear scientific plots.
-
-    Example
-    __________
-    figure = compare_results(cases, [res_dsacd, res_fix_dsacd, res_rand_dsacd], style=['science', 'grid', 'no-latex'])
-
+    window_size: ``int``
+        The window size for the rolling average smoothing.
+    max_colors: ``int``
+        Maximum number of different colors to use in the plot.
     """
     plt.style.use(style)
-    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+    colors = plt.cm.get_cmap('tab10', max_colors).colors  # Get a colormap with enough colors
+    
     for idx, all_scores in enumerate(list_data_frames):
-        sem = all_scores.loc[:, all_scores.columns != "env_interactions"].sem(axis=1)
-        mean = all_scores.loc[:, all_scores.columns != "env_interactions"].mean(axis=1)
-        plt.fill_between(
-            all_scores["env_interactions"], mean - sem, mean + sem, interpolate=True, color=colors[idx], alpha=0.1
-        )
-        plt.plot(all_scores["env_interactions"], mean, label=cases[idx], color=colors[idx])
 
-    plt.title(label=title, fontsize=20, fontweight="bold")
-    plt.xticks(fontsize=16)
-    plt.yticks(fontsize=16)
+        # Ensure the indices are aligned
+        all_scores = all_scores.set_index("env_interactions")
+        all_scores = all_scores.reindex(np.arange(0, nb_steps + 1, 1000)).interpolate(method='linear').ffill().bfill()
+        
+        mean = all_scores.mean(axis=1)
+        smoothed_mean = mean.rolling(window=window_size, min_periods=1).mean()  # Apply rolling average
+
+        
+        plt.plot(np.arange(0, nb_steps + 1, 1000), smoothed_mean, label=cases[idx], color=colors[idx % max_colors])
+
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
     plt.xlim(xmin=0, xmax=nb_steps)
     plt.ticklabel_format(style="sci", axis="x", scilimits=(3, 3))
     plt.ylim(ymin=ymin, ymax=ymax)
-    plt.xlabel("environment interactions", fontsize=16)
-    plt.ylabel(ylabel, fontsize=16)
+    plt.xlabel("environment interactions", fontsize=24)
+    plt.ylabel(ylabel, fontsize=24)
+    #plt.legend(fontsize=18, loc="lower right")
+    f = plt.gcf()
+    f.set_size_inches(15, 7)
+    return f
+
+
+
+def compare_all_results(
+    cases,
+    list_data_frames,
+    style="default",
+    nb_steps=1000,
+    ymin=-105,
+    ymax=105,
+    ylabel="Mean score",
+    title="Training Scores",
+    confidence_level=0.95  # Add confidence level parameter
+):
+    plt.style.use(style)
+    colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
+
+    # Define hardcoded labels for each case
+    case_labels = {
+        "case_14_ppo_ppo": "PPO",
+        "case_14_ippo_ippo": "IPPO CAPA",
+        "case_14_ippo_i_raippo": "IPPO I",
+        "case_14_2k_hac_ac_urgent": "HAC ac",
+        #"case_14_2k_hac_ac_urgent": "RAIPPO",
+        #"case_14_2k_hac_ac_urgent": "Urgent",
+        "case_14_2k_hac_ac_prob": "Probabilistic",
+        "case_14_2k_hac_ac_cyclic": "Cyclic",
+        "case_14_2k_hac_ac_random": "Random",
+        "case_14_2k_hac_a_urgent": "HAC a",
+        "case_14_2k_sc_ac_urgent": "SC ac",
+        "case_14_2k_u_urgent": "Unw",
+        "case_14_3k_u_urgent": "Unw",
+        "case_14_3k_a_urgent": "Action",
+        "case_14_3k_louvain_urgent": "Louvain",
+        "case_14_3k_hac_ac_urgent": "HAC ac",
+        "case_14_4k_sc_a_urgent": "SC a",
+        "case_14_4k_sc_ac_urgent": "SC ac",
+        "case_14_4k_hac_a_urgent": "HAC a",
+        "case_14_4k_hac_ac_urgent": "HAC ac",
+    }
+
+    z_score = stats.norm.ppf(1 - (1 - confidence_level) / 2)  # Calculate z-score for the confidence level
+
+    for idx, all_scores in enumerate(list_data_frames):
+        mean = all_scores.filter(regex='_mean').mean(axis=1)
+        std = all_scores.filter(regex='_std').mean(axis=1)
+        sem = std / np.sqrt(all_scores.shape[1])  # Calculate SEM
+        ci = sem * z_score  # Calculate confidence interval
+
+        plt.fill_between(
+            all_scores["env_interactions"], mean - ci, mean + ci, interpolate=True, color=colors[idx], alpha=0.1
+        )
+        case_label = case_labels.get(cases[idx], cases[idx])  # Get the label from the dictionary or use the case name
+        plt.plot(all_scores["env_interactions"], mean, label=case_label, color=colors[idx])
+
+    #plt.title(label=title, fontsize=20, fontweight="bold")
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
+    plt.xlim(xmin=0, xmax=nb_steps)
+    plt.ticklabel_format(style="sci", axis="x", scilimits=(3, 3))
+    plt.ylim(ymin=ymin, ymax=ymax)
+    plt.xlabel("Environment interactions", fontsize=24)
+    plt.ylabel(ylabel, fontsize=24)
     plt.legend(fontsize=18, loc="lower right")
     f = plt.gcf()
     f.set_size_inches(15, 7)
     return f
 
+def compare_step_results(cases, step_data, style, nb_steps):
+    plt.style.use(style)
+    fig, ax = plt.subplots()
+
+    for case, data in zip(cases, step_data):
+        mean_step = data.mean(axis=1)
+        x_values = range(0, len(mean_step) * (nb_steps // len(mean_step)), nb_steps // len(mean_step))
+        ax.plot(x_values, mean_step, label=case)
+
+
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
+    plt.ticklabel_format(style="sci", axis="x", scilimits=(3, 3))
+    ax.set_xlabel('Environment interactions', fontsize=24)
+    ax.set_ylabel('Mean step', fontsize=24)
+    #ax.set_title('Training Steps')
+    ax.legend()
+    
+    return fig
+
+def smooth_data(data, window_size):
+    return data.rolling(window=window_size, min_periods=1).mean()
+
+def compare_all_step_results(cases, all_step_data, style, nb_steps, window_size=100):
+    plt.style.use(style)
+    fig, ax = plt.subplots()
+    
+    for case in cases:
+        case_data = all_step_data.get(case, [])
+        if not case_data:
+            continue
+        
+        case_labels = {
+            "case_14_ppo_ppo": "PPO",
+            "case_14_ippo_ippo": "IPPO CAPA",
+            "case_14_ippo_i_raippo": "IPPO I",
+            #"case_14_2k_hac_ac_urgent": "RAIPPO",
+            #"case_14_2k_hac_ac_urgent": "HAC ac",
+            "case_14_2k_hac_ac_urgent": "Urgent",
+            "case_14_2k_hac_ac_prob": "Probabilistic",
+            "case_14_2k_hac_ac_cyclic": "Cyclic",
+            "case_14_2k_hac_ac_random": "Random",
+            "case_14_2k_hac_a_urgent": "HAC a",
+            "case_14_2k_sc_ac_urgent": "SC ac",
+            "case_14_2k_u_urgent": "Unw",
+            "case_14_3k_u_urgent": "Unw",
+            "case_14_3k_a_urgent": "Action",
+            "case_14_3k_louvain_urgent": "Louvain",
+            "case_14_3k_hac_ac_urgent": "HAC ac",
+            "case_14_4k_sc_a_urgent": "SC a",
+            "case_14_4k_sc_ac_urgent": "SC ac",
+            "case_14_4k_hac_a_urgent": "HAC a",
+            "case_14_4k_hac_ac_urgent": "HAC ac",
+        }
+
+        # Pad shorter sequences with NaN
+        max_length = 101
+        padded_case_data = []
+        for data in case_data:
+            if len(data) < max_length:
+                padding = pd.DataFrame(np.nan, index=range(max_length - len(data)), columns=data.columns)
+                padded_data = pd.concat([data, padding], ignore_index=True)
+            else:
+                padded_data = data
+            padded_case_data.append(padded_data)
+
+        # Stack the data to compute mean and std
+        stacked_data = np.dstack([data.values for data in padded_case_data])
+        mean_step = np.nanmean(stacked_data, axis=2).flatten()
+        std_step = np.nanstd(stacked_data, axis=2).flatten()
+        
+        # Apply smoothing
+        mean_step_smooth = smooth_data(pd.Series(mean_step), window_size)
+        std_step_smooth = smooth_data(pd.Series(std_step), window_size)
+        
+        # Limit std to be within 0 and 864
+        std_step_smooth = np.clip(std_step_smooth, 0, 864)
+        
+        x_values = range(0, len(mean_step_smooth) * (nb_steps // len(mean_step_smooth)), nb_steps // len(mean_step_smooth))
+        case_label = case_labels.get(case, case)  # Get the label from the dictionary or use the case name
+        ax.plot(x_values, mean_step_smooth, label=case_label)
+        ax.fill_between(x_values, mean_step_smooth - std_step_smooth, mean_step_smooth + std_step_smooth, alpha=0.2)
+
+    ax.set_ylim(top=864)
+    plt.xticks(fontsize=18)
+    plt.yticks(fontsize=18)
+    plt.ticklabel_format(style="sci", axis="x", scilimits=(3, 3))
+    ax.set_xlabel('Environment interactions', fontsize=24)
+    ax.set_ylabel('Mean step', fontsize=24)
+    #ax.set_title('Training Steps')
+    ax.legend(fontsize=18)
+    
+    return fig
 
 def get_trial_res(trial_dir, n_seeds):
     df = pd.DataFrame()
@@ -351,7 +517,6 @@ def plot_action_gantt(folder):
             plt.show()
     else:
         print(f"The folder %s does not contain any Ch*.npy files." % folder)
-
 
 def plot_safe_gantt_np(folder, plot_title="Env check is safe "):
     files = [file for file in os.listdir(folder) if file.endswith("safe.npy") & file.startswith("Ch")]
@@ -1003,13 +1168,21 @@ def plot_action_proportions(res_dir, cases, eval=True, nb_step=None):
         nb_step (int or None): The specific training step to load the data for, if eval is False.
     """
     plt.figure(figsize=(10, 6))
-    width = 0.15  # Width of the bars
+    width = 0.2  # Width of the bars
     n = len(cases)  # Number of cases
-    colors = [color for _, color in zip(range(n), mcolors.TABLEAU_COLORS.values())]  # Fetch colors from TABLEAU_COLORS
+    color_order = ['blue', 'green', 'orange', 'red']
+    colors = [mcolors.TABLEAU_COLORS[f'tab:{color}'] for color in color_order]
 
     # Create subplot
     ax = plt.subplot(111)
     
+    case_labels = {
+        "case_14_ppo_ppo_7": "PPO",
+        "case_14_ippo_ippo_0": "IPPO CAPA",
+        "IPPO_I_2": "IPPO I",
+        "case_14_2k_hac_ac_prob_raippo_0": "RAIPPO",
+    }
+
     for i, case in enumerate(cases):
         # Construct file path
         if eval:
@@ -1025,23 +1198,41 @@ def plot_action_proportions(res_dir, cases, eval=True, nb_step=None):
         proportions = data.div(data.sum(axis=1), axis=0)
         means = proportions.mean()  # Mean proportion of each substation
         
+        # Drop 'sub2' if it exists
+        if 'sub_2' in means.index:
+            means = means.drop(['sub_2'])
+        
+        # Sort indices correctly, ensuring 'sub12' is last
+        means = means.reindex(sorted(means.index, key=lambda x: (int(re.sub(r'\D', '', x)) if x != 'sub12' else 12)))
+        
         # Determine bar positions
         indices = np.arange(len(means)) + i * width
         
         # Plot
-        ax.bar(indices, means, width=width, label=case, color=colors[i])
+        case_label = case_labels.get(case, case)
+        ax.bar(indices, means, width=width, label=case_label, color=colors[i])
+    plt.style.use(['science', 'grid', 'no-latex'])
     
     # Set chart title and labels
-    plt.title('Proportion of Actions by Substation', fontsize=16)
-    plt.xlabel('Affected Substation', fontsize=14)
-    plt.ylabel('Proportion of Actions', fontsize=14)
-
+    plt.xlabel('Affected Substation', fontsize=24)
+    plt.ylabel('Proportion of Actions', fontsize=24)
+    plt.xticks(fontsize=19)
+    plt.yticks(fontsize=20)
+    plt.ticklabel_format(style="sci", axis="x", scilimits=(3, 3))
+    f = plt.gcf()
+    f.set_size_inches(8, 6)
+    
     # Set x-ticks
     ax.set_xticks(np.arange(len(means)) + width * (n / 2 - 0.5))
-    ax.set_xticklabels(means.index)
+    new_labels = [re.sub(r'sub_(\d+)', r'sub \1', label) for label in means.index]  # Replace "sub_X" with "sub X"
+    ax.set_xticklabels(new_labels)
     
+    # Adjust subplot parameters to reduce padding
+    plt.tight_layout(pad=0.0)
+
+
     # Add legend
-    plt.legend(title='Agent Type', fontsize=12)
+    plt.legend(fontsize=18)
     
     # Show plot
     plt.show()
@@ -1243,157 +1434,151 @@ def plot_unique_topos(res_dir, cases, eval=True, nb_step=None):
     # Show plot
     plt.show()
 
-def read_csv_with_suffix(file_path, suffix=None):
-    if suffix:
-        file_path = file_path.replace(".csv", f"{suffix}.csv")
-    with open(file_path, 'r') as f:
-        reader = csv.reader(f)
-        data = [row for row in reader]
-    return data
-
-def compute_per_chronic_measures(output_dir, chronic_ids, suffix=None):
-    results = []
-
-    # Read necessary files
-    score_data = read_csv_with_suffix(os.path.join(output_dir, "score.csv"), suffix)[0]
-    step_data = read_csv_with_suffix(os.path.join(output_dir, "step.csv"), suffix)[0]
-    action_counts_data = read_csv_with_suffix(os.path.join(output_dir, "action_counts.csv"), suffix)
-    steps_overloaded_data = read_csv_with_suffix(os.path.join(output_dir, "steps_overloaded.csv"), suffix)
-    unique_topologies_data = read_csv_with_suffix(os.path.join(output_dir, "unique_topologies_chron.csv"), suffix)[0]
-    # substation_configs_data = read_csv_with_suffix(os.path.join(output_dir, "unique_substation_configurations.csv"), suffix)
-    sub_depths_data = read_csv_with_suffix(os.path.join(output_dir, "sub_depths.csv"), suffix)
-    elem_depths_data = read_csv_with_suffix(os.path.join(output_dir, "elem_depths.csv"), suffix)
-    is_safe_data = read_csv_with_suffix(os.path.join(output_dir, "is_safe.csv"), suffix)
-
-    action_counts_headers = action_counts_data[0]
-    steps_overloaded_headers = steps_overloaded_data[0]
-    # substation_configs_headers = substation_configs_data[0]
-    sub_depths_headers = sub_depths_data[0]
-    elem_depths_headers = elem_depths_data[0]
-    is_safe_headers = is_safe_data[0]
-
-    for i, chronic_id in enumerate(chronic_ids):
-        # Extract measures
-        score = float(score_data[i])
-        step = int(step_data[i])
-        total_action_count = sum(int(action_counts_data[i + 1][col_index]) for col_index in range(1, len(action_counts_data[0])))
-        total_action_count_per_sub = [int(action_counts_data[i + 1][col_index]) for col_index in range(1, len(action_counts_data[0]))]
-        proportion_actions_per_sub = [(int(action_counts_data[i + 1][col_index]) / total_action_count) for col_index in range(1, len(action_counts_data[0]))] if total_action_count > 0 else [0] * (len(action_counts_data[0]) - 1)
-        steps_in_danger = sum(1 for row in is_safe_data if row[i + 1] == 'False')
-        ratio_actions_per_step_in_danger = total_action_count / steps_in_danger if steps_in_danger else 0
-        steps_over_rho = {steps_overloaded_data[row_index][0]: int(steps_overloaded_data[row_index][i + 1]) for row_index in range(1, len(steps_overloaded_data))}
-        total_unique_topologies = int(unique_topologies_data[i])
-        print(total_unique_topologies)
-        sub_depth = int(sub_depths_data[i + 1][1])
-        elem_depth = int(elem_depths_data[i + 1][1])
-
-        results.append([
-            chronic_id, score, step, total_action_count, total_action_count_per_sub,
-            proportion_actions_per_sub, steps_in_danger, ratio_actions_per_step_in_danger,
-            steps_over_rho, total_unique_topologies,
-            sub_depth, elem_depth
-        ])
-
-    # Write results to CSV
-    with open(os.path.join(output_dir, f"per_chronic_measures{suffix}.csv"), 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            "Chronic_ID", "Score", "Step", "Total_Action_Count", "Total_Action_Count_Per_Sub",
-            "Proportion_Actions_Per_Sub", "Steps_In_Danger", "Ratio_Actions_Per_Step_In_Danger",
-            "Steps_Over_Rho", "Total_Unique_Topologies",
-            "Sub_Depth", "Elem_Depth"
-        ])
-        writer.writerows(results)
-
-def compute_across_chronic_measures(output_dir, chronic_ids):
+def compute_across_chronic_measures(output_dir, evaluate=True, verbose=False, suffix=None):
     # Helper function to read csv with suffix
-    def read_csv_with_suffix(file_path, suffix):
+    def read_csv_with_suffix(file_path, suffix, header=True):
+        if suffix is not None:
+            file_path = file_path.replace(".csv", f"{suffix}.csv")
         with open(file_path, 'r') as f:
             reader = csv.reader(f)
-            headers = next(reader)
-            data = [row for row in reader]
-        return headers, data
-
-    # Read all the relevant CSV files
-    score_headers, score_data = read_csv_with_suffix(os.path.join(output_dir, "score.csv"), "")
-    step_headers, step_data = read_csv_with_suffix(os.path.join(output_dir, "step.csv"), "")
-    unique_topologies_headers, unique_topologies_data = read_csv_with_suffix(os.path.join(output_dir, "unique_topologies_chron.csv"), "")
-    sub_depths_headers, sub_depths_data = read_csv_with_suffix(os.path.join(output_dir, "sub_depths.csv"), "")
-    elem_depths_headers, elem_depths_data = read_csv_with_suffix(os.path.join(output_dir, "elem_depths.csv"), "")
-    action_counts_headers, action_counts_data = read_csv_with_suffix(os.path.join(output_dir, "action_counts.csv"), "")
-    steps_overloaded_headers, steps_overloaded_data = read_csv_with_suffix(os.path.join(output_dir, "steps_overloaded.csv"), "")
-    unique_topos_total_headers, unique_topos_total_data = read_csv_with_suffix(os.path.join(output_dir, "unique_topologies_total.csv"), "")
-
-    # Initialize metrics
-    total_scores = []
-    total_steps = []
-    total_unique_topologies = []
-    total_sub_depths = []
-    total_elem_depths = []
-    total_steps_overloaded = {rho: [] for rho in steps_overloaded_headers[1:]}
-    total_action_counts = {sub: [] for sub in action_counts_headers[1:]}
-
-    # Process each chronic_id
-    for chronic_id in chronic_ids:
-        chronic_index = int(chronic_id)  # assuming chronic_id is integer
-        score = float(score_data[0][chronic_index])
-        step = int(step_data[0][chronic_index])
-        unique_topologies = int(unique_topologies_data[0][chronic_index])
-        sub_depth = float(sub_depths_data[0][chronic_index])
-        elem_depth = float(elem_depths_data[0][chronic_index])
-        
-        total_scores.append(score)
-        total_steps.append(step)
-        total_unique_topologies.append(unique_topologies)
-        total_sub_depths.append(sub_depth)
-        total_elem_depths.append(elem_depth)
-        
-        for row_index, rho in enumerate(steps_overloaded_headers[1:], 1):
-            total_steps_overloaded[rho].append(int(steps_overloaded_data[row_index][chronic_index + 1]))
-        
-        for sub in action_counts_headers[1:]:
-            sub_index = action_counts_headers.index(sub)
-            total_action_counts[sub].append(int(action_counts_data[chronic_index][sub_index]))
-
-    # Calculate means and standard deviations
-    mean_score = mean(total_scores)
-    std_score = stdev(total_scores)
-    mean_step = mean(total_steps)
-    std_step = stdev(total_steps)
-    mean_unique_topologies = mean(total_unique_topologies)
-    std_unique_topologies = stdev(total_unique_topologies)
-    mean_sub_depth = mean(total_sub_depths)
-    std_sub_depth = stdev(total_sub_depths)
-    mean_elem_depth = mean(total_elem_depths)
-    std_elem_depth = stdev(total_elem_depths)
-
-    mean_steps_overloaded = {rho: mean(total_steps_overloaded[rho]) for rho in total_steps_overloaded}
-    std_steps_overloaded = {rho: stdev(total_steps_overloaded[rho]) for rho in total_steps_overloaded}
+            if header:
+                headers = next(reader)
+                data = [row for row in reader]
+                return headers, data
+            else:
+                data = [row for row in reader]
+                return data
     
-    mean_action_counts = {sub: mean(total_action_counts[sub]) for sub in total_action_counts}
-    std_action_counts = {sub: stdev(total_action_counts[sub]) for sub in total_action_counts}
-    total_action_count = sum([sum(total_action_counts[sub]) for sub in total_action_counts])
-    total_action_count_per_sub = {sub: sum(total_action_counts[sub]) for sub in total_action_counts}
-    proportion_action_count_per_sub = {sub: total_action_count_per_sub[sub] / total_action_count for sub in total_action_counts}
-    steps_in_danger = sum([sum(total_steps_overloaded[rho]) for rho in total_steps_overloaded])
-    ratio_actions_per_step_in_danger = total_action_count / steps_in_danger
+    if evaluate:
+        final_dir = output_dir
+        score_data = read_csv_with_suffix(os.path.join(final_dir, "score.csv"), "", header=False)
+    else:
+        final_dir = os.path.join(output_dir, "train_measures")
+        score_headers, score_data = read_csv_with_suffix(os.path.join(final_dir, "score.csv"), "")
+    
+    # Read all the relevant CSV files
+    step_data = read_csv_with_suffix(os.path.join(final_dir, "step.csv"), "", header=False)
+    sub_depths_headers, sub_depths_data = read_csv_with_suffix(os.path.join(final_dir, "sub_depths.csv"), "")
+    elem_depths_headers, elem_depths_data = read_csv_with_suffix(os.path.join(final_dir, "elem_depths.csv"), "")
+    unique_topos_total_headers, unique_topos_total_data = read_csv_with_suffix(os.path.join(final_dir, "unique_topologies_total.csv"), "")
+    _, unique_substation_data = read_csv_with_suffix(os.path.join(final_dir, "unique_substation_configurations.csv"), "")
+    is_safe_data = read_csv_with_suffix(os.path.join(final_dir, "is_safe.csv"), "", header=False)
 
-    # Write the overall measures to CSV
-    overall_measures_path = os.path.join(output_dir, "overall_measures.csv")
-    with open(overall_measures_path, 'w', newline='') as f:
-        writer = csv.writer(f)
-        writer.writerow(["Metric", "Mean", "Std"])
-        writer.writerow(["Number of scenarios tested", len(chronic_ids)])
-        writer.writerow(["Mean Score", mean_score, std_score])
-        writer.writerow(["Mean Step", mean_step, std_step])
-        writer.writerow(["Total action count", total_action_count])
-        writer.writerow(["Total action Count (per substation)", json.dumps(total_action_count_per_sub)])
-        writer.writerow(["Proportion of actions (per substation)", json.dumps(proportion_action_count_per_sub)])
-        writer.writerow(["Steps in danger", steps_in_danger])
-        writer.writerow(["Ratio of actions per step in danger", ratio_actions_per_step_in_danger])
-        for rho in mean_steps_overloaded:
-            writer.writerow([f"Steps network is over {rho}", mean_steps_overloaded[rho], std_steps_overloaded[rho]])
-        writer.writerow(["Total number of unique topologies", mean_unique_topologies, std_unique_topologies])
-        writer.writerow(["Total number of unique substation configurations (per substation)", json.dumps(total_action_count_per_sub)])
-        writer.writerow(["Mean sub depth", mean_sub_depth, std_sub_depth])
-        writer.writerow(["Mean element depth", mean_elem_depth, std_elem_depth])
+    # List to store the output strings
+    output_lines = []
+
+    # 1. Mean episode length and standard deviation from step_data
+    first_row_step = list(map(float, step_data[0]))
+    mean_episode_length = round(np.mean(first_row_step), 2)
+    std_episode_length = round(np.std(first_row_step), 2)
+
+    output_lines.append(f"Mean episode length: {mean_episode_length:.2f}")
+    output_lines.append(f"Standard deviation of episode length: {std_episode_length:.2f}")
+
+    # 2. Mean reward and std from score_data
+    first_row_score = list(map(float, score_data[0]))
+    mean_reward = round(np.mean(first_row_score), 2)
+    std_reward = round(np.std(first_row_score), 2)
+
+    output_lines.append(f"Mean reward: {mean_reward:.2f}")
+    output_lines.append(f"Standard deviation of reward: {std_reward:.2f}")
+
+    # 3. Number of unsolved scenarios
+    num_unsolved_scenarios = len([res for res in first_row_score if float(res) < 80.0])
+
+    output_lines.append(f"Number of unsolved scenarios: {num_unsolved_scenarios}")
+
+    # 4. Number of actions
+    num_topo_changes = sum(int(row[2]) for row in unique_substation_data)
+
+    output_lines.append(f"Number of actions: {num_topo_changes}")
+
+    # 5. Number of topology changes
+    total_topo_changes = 0
+    for row in unique_substation_data:
+        config = row[1].split()
+        count = int(row[2])
+        num_twos = config.count('2')
+        total_topo_changes += num_twos * count
+
+    output_lines.append(f"Number of topo changes: {total_topo_changes}")
+
+    # Total number of steps survived
+    total_steps_survived = sum(map(int, step_data[0]))
+    # Total steps in danger
+    is_safe_array = np.array(is_safe_data)
+    steps_in_danger = np.sum(is_safe_array == 'False')
+    
+    # 6. Proportion of timesteps network in danger
+    proportion_steps_in_danger = round(steps_in_danger / total_steps_survived, 2)
+
+    output_lines.append(f"Proportion of timesteps network in danger: {proportion_steps_in_danger:.2f}")
+
+    # 7. Activity while in danger
+    activity_while_in_danger = round(num_topo_changes / steps_in_danger, 2)
+
+    output_lines.append(f"Actions per step in danger: {activity_while_in_danger:.2f}")
+
+    topo_changes_per_step_in_danger = round(total_topo_changes / steps_in_danger, 2)
+
+    output_lines.append(f"Topo changes per timestep in danger: {topo_changes_per_step_in_danger:.2f}")
+
+    # 8. Number of unique topologies
+    num_unique_topologies = len(unique_topos_total_data)
+    output_lines.append(f"Number of unique topologies: {num_unique_topologies}")
+    
+    # 9. Number of unique topology configurations
+    substation_configs = {}
+    for row in unique_substation_data:
+        sub_id = row[0]
+        config = row[1]
+        count = row[2]
+        if sub_id not in substation_configs:
+            substation_configs[sub_id] = []
+        substation_configs[sub_id].append((config, count))
+
+    num_unique_topo_configs = len(unique_substation_data)
+    output_lines.append(f"Number of unique substation configurations: {num_unique_topo_configs}")
+
+    # 10. Mean and std of topo depth
+    sub_depths_df = pd.DataFrame(sub_depths_data[1:], columns=sub_depths_data[0]).apply(pd.to_numeric, errors='coerce')
+    sub_depths_df = sub_depths_df.iloc[:, 1:]
+
+    # Flatten the DataFrame to a single array of elements
+    all_elements = sub_depths_df.values.flatten()
+
+    # Compute the mean and standard deviation, ignoring NaNs
+    mean_topo_depth = round(np.nanmean(all_elements), 2)
+    std_topo_depth = round(np.nanstd(all_elements), 2)
+
+    output_lines.append(f"Mean topo depth: {mean_topo_depth:.2f}")
+    output_lines.append(f"Standard deviation of topo depth: {std_topo_depth:.2f}")
+
+    # 11. Mean and standard deviation of elem depth
+    elem_depths_df = pd.DataFrame(elem_depths_data[1:], columns=elem_depths_data[0]).apply(pd.to_numeric, errors='coerce')
+    elem_depths_df = elem_depths_df.iloc[:, 1:]
+    all_elements_elem = elem_depths_df.values.flatten()
+
+    # Compute the mean and standard deviation, ignoring NaNs
+    mean_elem_depth = round(np.nanmean(all_elements_elem), 2)
+    std_elem_depth = round(np.nanstd(all_elements_elem), 2)
+
+    output_lines.append(f"Mean elem depth: {mean_elem_depth:.2f}")
+    output_lines.append(f"Standard deviation of elem depth: {std_elem_depth:.2f}")
+
+    # Extra*. Identifying Substation configurations
+    output_lines.append("\nUnique Substation Configurations:")
+    for sub_id, configs in substation_configs.items():
+        output_lines.append(f"Sub id: {sub_id}")
+        for config, count in configs:
+            output_lines.append(f"  Config: {config}, Times chosen: {count}")
+
+    # Write the output to a file
+    output_file_path = os.path.join(final_dir, "summary_measures.txt")
+    with open(output_file_path, 'w') as output_file:
+        output_file.write("\n".join(output_lines))
+
+    # Print the output
+    if verbose:
+        for line in output_lines:
+            print(line)

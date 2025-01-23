@@ -94,8 +94,9 @@ class RuleBasedSubPicker(FixedSubPicker):
             self.previous_sub = sub_2_act
         return sub_2_act
 
-    
-class ClusteredCAPAPicker(object):
+# ReArPicker: Responsible Area Picker. Similar logic as CAPA ordering.
+# Discarded in the final experiment but base for the other pickers.
+class ReArPicker(object):
     def __init__(self, action_space, clusters):
         self.action_space = action_space
         self.clusters = clusters
@@ -109,9 +110,6 @@ class ClusteredCAPAPicker(object):
         self.calculate_cluster_priority(obs)
         # Sort clusters based on priority
         self.activation_sequence = sorted(range(len(self.clusters)), key=lambda i: -self.cluster_priority[i])
-        # print("self.activation_sequece", self.activation_sequence)
-        # print("self.cluster_priority", self.cluster_priority)
-        # print("self.clusters", self.clusters)
 
     def calculate_cluster_priority(self, obs):
         self.cluster_priority = []
@@ -136,24 +134,87 @@ class ClusteredCAPAPicker(object):
 
     def count_ra_transitions(self, next_ra):
         if self.previous_ra != None:
-            # print("\n ", self.clusters, self.previous_ra, next_ra)
             prev = self.previous_ra
             next = next_ra
             self.count[prev, next] += 1
 
-# still need to limit the amount of times in a row that it can access the same RA
-class UrgentPicker(ClusteredCAPAPicker):
+# RandomPicker: randomly select a cluster
+class RandomPicker(ReArPicker):
+    def __init__(self, action_space, clusters):
+        super(RandomPicker, self).__init__(action_space, clusters)
+
+    def update_activation_sequence(self, obs):
+        # Randomly shuffle the clusters
+        self.activation_sequence = list(range(len(self.clusters)))
+        random.shuffle(self.activation_sequence)
+
+# UrgentPicker: only contains the most urgent cluster
+class UrgentPicker(ReArPicker):
     def __init__(self, action_space, clusters):
         super(UrgentPicker, self).__init__(action_space, clusters) 
 
     def update_activation_sequence(self, obs):
         self.calculate_cluster_priority(obs)
-
-        # Set activation sequence to only contain this most urgent cluster
+        # Set activation sequence to only contain the most urgent cluster
         most_urgent_cluster_index = self.cluster_priority.index(max(self.cluster_priority))
         self.activation_sequence = [most_urgent_cluster_index]
 
-class UrgentLimitedPicker(ClusteredCAPAPicker):
+# ProbabilisticPicker: pick cluster based on a probability distribution derived from danger values
+class ProbabilisticPicker(ReArPicker):
+    def __init__(self, action_space, clusters):
+        super(ProbabilisticPicker, self).__init__(action_space, clusters)
+
+    def update_activation_sequence(self, obs):
+        self.calculate_cluster_priority(obs)
+
+        # Convert cluster_priority to a numpy array
+        cluster_priority_array = np.array(self.cluster_priority)
+
+        # Shifted exponential transformation with non-negative values
+        exp_priorities = np.maximum(np.exp(cluster_priority_array - 0.7) - 1, 0)
+        # Using 0.7 means that e.g. if the max danger value for one cluster is 0.8 -> we get 0.11 exp_priority,
+                #                                       and for the other it is 0.9 -> we get 0.22 exp_priority
+                # then, in the after transformation, the second cluster has twice the probability of being picked compared to the first one.
+        # Calculate probabilities based on transformed priorities
+        total_priority = sum(exp_priorities)
+        if total_priority > 0:
+            probabilities = [priority / total_priority for priority in exp_priorities]
+        else:
+            probabilities = [1 / len(self.clusters) for _ in self.clusters]
+
+        # Select a cluster based on the calculated probabilities
+        chosen_cluster = np.random.choice(range(len(self.clusters)), p=probabilities)
+        self.activation_sequence = [chosen_cluster]
+
+# CyclicPicker: pick cluster based on a fixed cycle
+class CyclicPicker(ReArPicker):
+    def __init__(self, action_space, clusters):
+        super(CyclicPicker, self).__init__(action_space, clusters)
+        self.current_index = 0  # To keep track of the current index in the cycle
+
+    def update_activation_sequence(self, obs):
+        # No need to update activation sequence for CyclicPicker as it follows a fixed order
+        pass
+
+    def pick_cluster(self, obs, sample):
+        # Pick the next cluster in the cycle
+        picked_ra = self.current_index
+        self.current_index = (self.current_index + 1) % len(self.clusters)
+
+        if sample:
+            self.count_ra_transitions(picked_ra)
+            self.previous_ra = picked_ra
+        
+        self.current_ra = picked_ra
+        return picked_ra
+
+    def complete_reset(self):
+        super().complete_reset()
+        self.current_index = 0
+
+# UrgentLimitedPicker: pick cluster based on priority, but decrease priority of the current cluster after each consecutive pick.
+# Discarded in the final experiment.
+class UrgentLimitedPicker(ReArPicker):
     def __init__(self, action_space, clusters, exploration_coeff=0.9):
         super(UrgentLimitedPicker, self).__init__(action_space, clusters)
         self.consecutive_picks = 0 # Count of consecutive picks for the current cluster

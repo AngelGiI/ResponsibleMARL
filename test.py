@@ -16,12 +16,13 @@ from Agents.sac import SAC, SMAAC
 from Agents.SACD import SacdGoal, SacdSimple, SacdEmb
 from Agents.DQN import DQN, DQN2
 from Agents.PPO import PPO
-from train import TrainAgent, Train
+from train import TrainAgent, Train, TrainFull
 
 import matplotlib.cbook
 import warnings
 from grid2op.Chronics import FromHandlers
 from grid2op.Chronics.handlers import PerfectForecastHandler, CSVHandler
+from grid2op.Parameters import Parameters
 
 warnings.filterwarnings("ignore", category=matplotlib.MatplotlibDeprecationWarning)
 warnings.filterwarnings("ignore", message=".*: No more data to get, the last known data is returned.")
@@ -30,6 +31,8 @@ warnings.filterwarnings("ignore", message=".*: No more data to get, the last kno
 ENV_CASE = {
     "5": "rte_case5_example",
     "14": "l2rpn_case14_sandbox",
+    "36": "l2rpn_icaps_2021_small",
+    "118": "l2rpn_neurips_2020_track2_small",
 }
 
 DATA_SPLIT = {
@@ -38,9 +41,9 @@ DATA_SPLIT = {
         list(range(0, 40 * 26, 40)),
         list(range(1, 100 * 10 + 1, 100)),
         list(range(2, 100 * 10 + 2, 100)),
+        #[list(range(start, 100 * 10 + start, 100)) for start in range(2, 3)],
     ),
 }
-
 
 def get_max_ffw(case):
     MAX_FFW = {"5": 5, "14": 26}
@@ -89,8 +92,11 @@ def cli():
 
     # General env parameters
     parser.add_argument("-s", "--seed", type=int, default=0)
-    parser.add_argument("-c", "--case", type=str, default="5", choices=["14", "5"])
-    parser.add_argument("-rw", "--reward", type=str, default="margin", choices=["loss", "margin"])
+    parser.add_argument("-c", "--case", type=str, default="14", choices=["14", "5"])
+    parser.add_argument("-rw", "--reward", type=str, default="loss", choices=["loss", "margin"])
+    parser.add_argument("-tf", "--train_full", action="store_true", help="Train and Test on entire episodes.")
+    parser.add_argument("-tef", "--test_full", action="store_true", help="Test on entire episodes.")
+    parser.add_argument("-np", "--no_prio", action="store_true", help="switch of prio difficult episodes.")
     parser.add_argument("-gpu", "--gpuid", type=int, default=0)
     parser.add_argument("-ml", "--memlen", type=int, default=50000)
     parser.add_argument(
@@ -147,8 +153,8 @@ def cli():
         "-ma",
         "--middle_agent",
         type=str,
-        default="capa",
-        choices=["fixed", "random", "capa"],
+        default="random",
+        choices=["fixed", "random", "capa", "prob", "urgent"],
     )
 
     # Choose the lowest level agent
@@ -156,7 +162,7 @@ def cli():
         "-a",
         "--agent",
         type=str,
-        default="sacd_emb",
+        default="ppo",
         choices=[
             "sac",
             "sac2",
@@ -176,7 +182,7 @@ def cli():
     )
 
     # (Deep) learning  parameters
-    parser.add_argument("-nn", "--network", type=str, default="lin")
+    parser.add_argument("-nn", "--network", type=str, default="lin", choices=["lin", "gnn"])
     parser.add_argument(
         "-hn",
         "--head_number",
@@ -242,8 +248,16 @@ def cli():
     parser.add_argument("-l", "--lambda", type=float, default=0.95, help="GAE parameter PPO")
 
     # ReAr parameters
-    parser.add_argument("-nc", "--n_clusters", type=int, help="number of clusters", default=1)
-    parser.add_argument("-cm", "--cluster_method", type=str, help="clustering method", default="kmeans")
+    parser.add_argument("-nc", "--n_clusters", type=int, help="number of clusters", default=2)
+    parser.add_argument("-cm", "--cluster_method", type=str, help="clustering method", default="hierarchical")
+    parser.add_argument(
+        "-am", 
+        "--adjacency_matrix", 
+        type=str, 
+        help="type of adjacency matrix",
+        default="actions_congestion",
+        choices=["unweighted", "congestion", "actions", "actions_congestion"],
+    )
     
     args = parser.parse_args()
     return args
@@ -275,6 +289,23 @@ def read_ffw_json(path, chronics, case):
                 break
     return res
 
+# def read_ffw_json_eval(path, chronics_list, case):
+#     res_list = []
+#     for chronics in chronics_list:
+#         res = {}
+#         for i in chronics:
+#             for j in range(get_max_ffw(case)):
+#                 with open(os.path.join(path, f"{i}_{j}.json"), "r", encoding="utf-8") as f:
+#                     a = json.load(f)
+#                     res[(i, j)] = (
+#                         a["dn_played"],
+#                         a["donothing_reward"],
+#                         a["donothing_nodisc_reward"],
+#                     )
+#                 if i >= 2880:
+#                     break
+#         res_list.append(res)
+#     return res_list
 
 def seed_everything(seed_value):
     random.seed(seed_value)
@@ -290,6 +321,15 @@ def seed_everything(seed_value):
 
 
 def def_env(args):
+    # use the assigned directory to avoid overhead on server/super computer
+    # grid2op_data_dir = os.path.join(grid2op_data_dir, ENV_CASE[args.case])
+    parameters = Parameters()
+    parameters.NB_TIMESTEP_OVERFLOW_ALLOWED = 3
+    parameters.NB_TIMESTEP_RECONNECTION = 12
+    # parameters.NB_TIMESTEP_COOLDOWN_LINE = 3
+    # parameters.NB_TIMESTEP_COOLDOWN_SUB = 3
+    parameters.HARD_OVERFLOW_THRESHOLD = 1.5
+
     return grid2op.make(
         ENV_CASE[args.case],
         test=True if args.case == "5" else False,
@@ -309,6 +349,7 @@ def def_env(args):
             "load_p_for_handler": PerfectForecastHandler("load_p_forecasted"),
             "load_q_for_handler": PerfectForecastHandler("load_q_forecasted"),
         },
+        param=parameters,
     )
 
 
@@ -317,21 +358,28 @@ def make_envs(args):
     my_dir = args.dir if args.dir else "."
     DATA_DIR = os.path.join(my_dir, "data")
     env_path = os.path.join(DATA_DIR, env_name)
+
+    
+    if args.dir:
+        grid2op_data_dir = os.path.join(args.dir, "data_grid2op")
+        #if doessnt exist os.makedir!!!!!!!!!!!
+        grid2op.change_local_dir(grid2op_data_dir)
+    print(f"Environment data location used is: {grid2op.get_current_local_dir()}")
+
     env = def_env(args)
     test_env = def_env(args)
 
     if not args.forecast:
         env.deactivate_forecast()
         test_env.deactivate_forecast()
-    test_env.parameters.NB_TIMESTEP_OVERFLOW_ALLOWED = env.parameters.NB_TIMESTEP_OVERFLOW_ALLOWED = 3
-    test_env.parameters.NB_TIMESTEP_RECONNECTION = env.parameters.NB_TIMESTEP_RECONNECTION = 12
-    test_env.parameters.NB_TIMESTEP_COOLDOWN_LINE = env.parameters.NB_TIMESTEP_COOLDOWN_LINE = 3
-    test_env.parameters.NB_TIMESTEP_COOLDOWN_SUB = env.parameters.NB_TIMESTEP_COOLDOWN_SUB = 3
-    test_env.parameters.HARD_OVERFLOW_THRESHOLD = env.parameters.HARD_OVERFLOW_THRESHOLD = 200.0
+    # test_env.parameters.NB_TIMESTEP_OVERFLOW_ALLOWED = env.parameters.NB_TIMESTEP_OVERFLOW_ALLOWED = 3
+    # test_env.parameters.NB_TIMESTEP_RECONNECTION = env.parameters.NB_TIMESTEP_RECONNECTION = 12
+    # test_env.parameters.NB_TIMESTEP_COOLDOWN_LINE = env.parameters.NB_TIMESTEP_COOLDOWN_LINE = 3
+    # test_env.parameters.NB_TIMESTEP_COOLDOWN_SUB = env.parameters.NB_TIMESTEP_COOLDOWN_SUB = 3
+    # test_env.parameters.HARD_OVERFLOW_THRESHOLD = env.parameters.HARD_OVERFLOW_THRESHOLD = 200.0
     # test_env.seed(59)
     # print(env.parameters.__dict__)
     return env, test_env, env_path
-
 
 def select_chronics(env_path, env, test_env, case, eval=False):
     # select chronics end define dn_ffw
@@ -342,7 +390,11 @@ def select_chronics(env_path, env, test_env, case, eval=False):
         chronics = test_chronics
     else:
         chronics = train_chronics + valid_chronics
-    dn_ffw = read_ffw_json(dn_json_path, chronics, case)
+
+    if os.path.exists(dn_json_path):
+        dn_ffw = read_ffw_json(dn_json_path, chronics, case)
+    else:
+        dn_ffw = None
 
     if os.path.exists(dn_json_path):
         for i in list(set(chronics)):
@@ -357,7 +409,6 @@ def select_chronics(env_path, env, test_env, case, eval=False):
     kept = test_env.chronics_handler.real_data.reset()
 
     return train_chronics, valid_chronics, test_chronics, dn_ffw, ep_infos
-
 
 def load_agent(args, my_dir, my_agent):
     model_input = f"{args.load_agent}"
@@ -410,10 +461,11 @@ if __name__ == "__main__":
     print(args)
     seed_everything(args.seed)
 
+
     # settings
-    model_name = f"{args.name}_{args.agent}_{args.seed}"
+    model_name = f"case_{args.case}_{args.name}_{args.agent}_{args.seed}"
     print("model name: ", model_name)
-    TRAINER = TrainAgent if args.agent == "sac" else Train
+    TRAINER = TrainFull if args.train_full else (TrainAgent if args.agent == "sac" else Train)
 
     my_dir = args.dir if args.dir else "."
     output_result_dir, model_path = make_dirs(model_name, os.path.join(my_dir, "result"))
@@ -444,6 +496,7 @@ if __name__ == "__main__":
         ep_infos,
         max_reward=args.max_reward,
         rw_func=args.reward,
+        test_full=args.test_full,
     )
 
     tic = datetime.now()
@@ -457,6 +510,7 @@ if __name__ == "__main__":
         model_path,
         get_max_ffw(args.case),
         best_score=best_score,
+        use_prio=not (args.no_prio),
     )
     toc = datetime.now()
     print("Duration of training the agent: ", toc - tic)

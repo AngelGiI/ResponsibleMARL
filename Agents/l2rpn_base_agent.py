@@ -24,7 +24,7 @@ class L2rpnAgent(BaseAgent):
         self.node_num = env.dim_topo
 
         self.action_converter = self.create_action_converter(
-            env, mask, mask_hi, bus_thresh=kwargs.get("threshold", 0.1), n_clusters=kwargs.get("n_clusters",1), cluster_method=kwargs.get("cluster_method","kmeans")
+            env, mask, mask_hi, bus_thresh=kwargs.get("threshold", 0.1), n_clusters=kwargs.get("n_clusters",1), cluster_method=kwargs.get("cluster_method","spectral"), adjacency_matrix=kwargs.get("adjacency_matrix","unweighted")
         )
         self.obs_converter = ObsConverter(env, self.danger, self.device, attr=kwargs.get("input"))
 

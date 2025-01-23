@@ -2,7 +2,7 @@ import numpy as np
 
 from converters import SimpleDiscActionConverter
 
-from ResponsibilityAreas.GroupingMethods import perform_clustering
+from ResponsibilityAreas.GroupingMethods import ClusteringManager
 
 class MADiscActionConverter(SimpleDiscActionConverter):
     def __init__(self, env, mask, mask_hi, rule="c"):
@@ -50,11 +50,13 @@ class MADiscActionConverter(SimpleDiscActionConverter):
             return self.action_space()
 
 class RAMAActionConverter(SimpleDiscActionConverter):
-    def __init__(self, env, mask, mask_hi, num_clusters, cluster_method, rule="c"):
-        self.num_clusters = num_clusters
-        self.cluster_method = cluster_method
+    def __init__(self, env, mask, mask_hi, num_clusters, cluster_method, adjacency_matrix="unweighted", rule="c"):
+        self.n_cl = num_clusters
+        self.cl_mtd = cluster_method
+        self.adj = adjacency_matrix
         self.node_num = len(env.action_space.sub_info)
         self.obs = env.get_obs()
+        self.masked_clusters = []
         super().__init__(env, mask, mask_hi, rule)
         self.n = 0  # not relevant for MA
         self.current_ra = None
@@ -62,17 +64,26 @@ class RAMAActionConverter(SimpleDiscActionConverter):
     def init_action_converter(self):
         sort_subs = np.argsort(-self.action_space.sub_info[self.action_space.sub_info > self.mask])
         self.masked_sorted_sub = self.subs[sort_subs]
-        
-        # Perform clustering
-        self.clusters = perform_clustering(self.cluster_method, self.node_num, self.masked_sorted_sub, self.num_clusters, self.obs)
+        n_actions = []
+        for sub in range(len(self.action_space.sub_info)):
+            n_actions.append(len(self.action_space.get_all_unitary_topologies_set(self.action_space, sub)))
+
+        clusters = ClusteringManager(self.cl_mtd, self.obs, self.n_cl, n_actions, self.mask, self.adj)
+        # self.clusters = [[0, 1, 2, 4], [3, 5, 6, 7, 8, 9, 10, 11, 12, 13]] <- example hardcoded RAs for 14 substation grid
+        self.clusters = clusters.perform_clustering()
         print(f"Clusters (before masking): {self.clusters}")
-        self.ra_idx = [i for i in range(len(self.clusters))] # Equivalent of self.masked_sorted_sub for RA in terms of usage.
+        # Filter clusters based on the mask
+        self.masked_clusters = []
+        for cluster in self.clusters:
+            masked_cluster = [sub for sub in cluster if self.action_space.sub_info[sub] > self.mask]
+            if masked_cluster:  # Only append non-empty clusters
+                self.masked_clusters.append(masked_cluster)
+        print(f"Clusters (after masking): {self.masked_clusters}")
+        self.ra_idx = [i for i in range(len(self.masked_clusters))]
         self.cluster_actions = []
         self.n_cluster_actions = []
-
         self.act_to_sub = {} # action to substation mapping
-
-        for cluster in self.clusters:
+        for cluster in self.masked_clusters:
             cluster_action_ids = []
             for sub in cluster:
                 if sub in self.masked_sorted_sub:

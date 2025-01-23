@@ -1,0 +1,38 @@
+Total maximum number of timesteps possible: 8064
+
+Chronic 3: Number of timesteps computed: 3000
+Chronic 43: Number of timesteps computed: 2
+Chronic 83: Number of timesteps computed: 803
+Chronic 123: Number of timesteps computed: 512
+Chronic 163: Number of timesteps computed: 1271
+Chronic 203: Number of timesteps computed: 1260
+Chronic 243: Number of timesteps computed: 479
+Chronic 283: Number of timesteps computed: 2821
+Chronic 323: Number of timesteps computed: 514
+Chronic 363: Number of timesteps computed: 2708
+Chronic 403: Number of timesteps computed: 963
+Chronic 443: Number of timesteps computed: 1092
+Chronic 483: Number of timesteps computed: 1089
+Chronic 523: Number of timesteps computed: 801
+Chronic 563: Number of timesteps computed: 1377
+Chronic 603: Number of timesteps computed: 4543
+Chronic 643: Number of timesteps computed: 4553
+Chronic 683: Number of timesteps computed: 517
+Chronic 723: Number of timesteps computed: 518
+Chronic 763: Number of timesteps computed: 1094
+Chronic 803: Number of timesteps computed: 1095
+Chronic 843: Number of timesteps computed: 796
+Chronic 883: Number of timesteps computed: 1093
+Chronic 923: Number of timesteps computed: 1085
+Chronic 963: Number of timesteps computed: 3267
+Chronic 1003: Number of timesteps computed: 521
+
+Total observations: 37800
+
+Average rho per power line: [0.31120053 0.3033225  0.30382577 0.23219728 0.67197347 0.19390275
+ 0.40178862 0.64066064 0.5332323  0.7970488  0.14247213 0.31393358
+ 0.36672422 0.47334263 0.4611472  0.43447793 0.41216594 0.5247531
+ 0.46909025 0.4043246 ]
+
+Average rho overall: 0.41957902908325195
+Maximum rho: 1.0291821956634521

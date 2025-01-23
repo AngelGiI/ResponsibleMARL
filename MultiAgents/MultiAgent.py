@@ -7,8 +7,7 @@ from Agents.SACD import BaseSacd, SacdShared
 from MultiAgents.MASACD import DependentSacd
 from MultiAgents.MAPPO import DependentPPO
 from MultiAgents.MAconverters import MADiscActionConverter, RAMAActionConverter
-from MultiAgents.MiddleAgent import RuleBasedSubPicker, RandomOrderedSubPicker, FixedSubPicker, ClusteredCAPAPicker, UrgentPicker
-
+from MultiAgents.MiddleAgent import RuleBasedSubPicker, RandomOrderedSubPicker, FixedSubPicker, UrgentPicker, RandomPicker, ProbabilisticPicker, CyclicPicker
 AGENT = {
     "isacd_base": BaseSacd,
     "isacd_emb": SacdShared,
@@ -93,7 +92,6 @@ class IMARL(L2rpnAgent):
                 if sample:
                     self.update_goal(goal)
                 elif (act == self.action_space()) & (dn_count < len(self.sub_picker.masked_sorted_sub)):
-                    print("\nhey!", dn_count+1)
                     # skip DoNothing action when we are not training
                     act = self.agent_act(obs, is_safe, sample, dn_count=dn_count + 1)
                 return act
@@ -154,23 +152,26 @@ class DepMARL(IMARL):
                 agent.dependent_update(self.agents.values(), trans_probs_agent)
 
 
+MIDDLE_AGENT_REAR = {
+    "fixed": CyclicPicker,
+    "random": RandomPicker,
+    "urgent": UrgentPicker,
+    "prob": ProbabilisticPicker,
+}
 class ReArIMARL(L2rpnAgent):
     """
     Each agent is responsible for an area (grouping of substations).
     """
     def __init__(self, env, **kwargs):
         super().__init__(env, **kwargs)
-        
-        # options: ClusteredCapaPicker or UrgentPicker
-        self.sub_picker = UrgentPicker(clusters=self.action_converter.clusters, action_space=self.action_space)
+        middle_agent = MIDDLE_AGENT_REAR[kwargs.get("middle_agent")]
+        self.sub_picker = middle_agent(clusters=self.action_converter.clusters, action_space=self.action_space)
 
         # create deep learning part of the agent
         self.create_DLA(**kwargs)
 
     def create_action_converter(self, env, mask, mask_hi, **kwargs):
-        print(f"kwargs: {kwargs}")
-        print(f"n_clusters: {kwargs.get('n_clusters',1)}")
-        return RAMAActionConverter(env, mask, mask_hi, kwargs.get("n_clusters",1), kwargs.get("cluster_method","kmeans"))
+        return RAMAActionConverter(env, mask, mask_hi, kwargs.get("n_clusters",1), kwargs.get("cluster_method","kmeans"), kwargs.get("adjacency_matrix","unweighted"))
 
     def create_DLA(self, **kwargs):
         agent_type = AGENT[kwargs.get("agent")]
@@ -178,14 +179,15 @@ class ReArIMARL(L2rpnAgent):
             agent_type(self.input_dim, act_dim, self.node_num, **kwargs)
             for act_dim in self.action_converter.n_cluster_actions
         ]
+        i = 0
+        for act_dim in self.action_converter.n_cluster_actions:
+            print(f"Agent {i} with action space size: {act_dim}")
+            i += 1  
         self.agents = dict(zip(self.action_converter.ra_idx, agents))
 
     def agent_act(self, obs, is_safe, sample, dn_count=0) -> BaseAction:
         # generate action if not safe
         if not is_safe:
-            # print()
-            # print("RAs to act: ",self.sub_picker.activation_sequence)
-
             with torch.no_grad():
                 stacked_state = self.get_current_state().to(self.device)
                 adj = self.adj.unsqueeze(0)
@@ -196,8 +198,7 @@ class ReArIMARL(L2rpnAgent):
                 #print(act)
                 if sample:
                     self.update_goal(goal)
-                #elif (act == self.action_space()) & (dn_count < len(self.sub_picker.activation_sequence)):
-                elif (act == self.action_space()) & (dn_count < 0):
+                elif (act == self.action_space()) & (dn_count < 1):
                     # skip DoNothing action when we are not training
                     act = self.agent_act(obs, is_safe, sample, dn_count=dn_count + 1)
                 return act

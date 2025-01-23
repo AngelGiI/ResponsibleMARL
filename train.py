@@ -5,15 +5,16 @@ import torch
 from matplotlib import pyplot as plt
 from tqdm import tqdm
 from datetime import datetime
+from grid2op.utils import ScoreL2RPN2023, ScoreL2RPN2020
 from util import (write_depths_to_csv, write_action_counts_to_csv, write_steps_ol_to_csv, write_topologies_to_csv, 
                   write_is_safe_to_csv, write_ra_action_counts_to_csv, write_substation_configs_to_csv, 
-                  write_unique_topos_total_to_csv, compute_per_chronic_measures, compute_across_chronic_measures)
+                  write_unique_topos_total_to_csv)
 
 from MultiAgents.MultiAgent import IMARL, ReArIMARL
 
 
 class TrainAgent(object):
-    def __init__(self, agent, env, test_env, dn_ffw, ep_infos, max_reward=10, rw_func="loss"):
+    def __init__(self, agent, env, test_env, dn_ffw, ep_infos, max_reward=10, rw_func="loss", test_full=False):
         self.agent = agent
         self.env = env
         self.test_env = test_env
@@ -22,8 +23,19 @@ class TrainAgent(object):
         self.max_rw = max_reward
         self.rw_func = rw_func
         self.last_number_updates = 0
-        self.last_stats = self.last_scores = self.last_steps = None
+        self.last_stats = self.last_scores = self.last_steps = self.last_full_scores = None
+        self.test_full = test_full
+        if self.test_full:
+            self.test_chron = [
+                os.path.basename(path) for path in self.test_env.chronics_handler.real_data.available_chronics()
+            ]
+            self.scores_2023 = ScoreL2RPN2023(
+                self.test_env,
+                nb_scenario=len(self.test_env.chronics_handler.real_data.available_chronics()),
+                # scores_func={"grid_operational_cost": L2RPNSandBoxScore},
+            )
 
+        # For evaluation purposes
         self.begin = {sub: self.agent.action_converter.sub_to_topo_begin[sub] for sub in self.agent.action_converter.masked_sorted_sub}
         self.end = {sub: self.agent.action_converter.sub_to_topo_end[sub] for sub in self.agent.action_converter.masked_sorted_sub}
         self.substation_id_to_index = {sub: idx for idx, sub in enumerate(self.agent.action_converter.masked_sorted_sub)}
@@ -42,8 +54,7 @@ class TrainAgent(object):
         self.last_donothings = 0
 
     # following competition evaluation script
-    def compute_episode_score(self, chronic_id, agent_step, agent_reward, ffw=None):
-        min_losses_ratio = 0.7
+    def compute_episode_score(self, chronic_id, agent_step, agent_costs, ffw=None):
         ep_marginal_cost = self.env.gen_cost_per_MW.max()
         if ffw is None:
             ep_do_nothing_reward = self.ep_infos[chronic_id]["donothing_reward"]
@@ -62,15 +73,26 @@ class TrainAgent(object):
         blackout_loads = ep_loads[agent_step:]
         if len(blackout_loads) > 0:
             blackout_reward = np.sum(blackout_loads) * ep_marginal_cost
-            agent_reward += blackout_reward
+            agent_costs += blackout_reward
 
         # Compute ranges
+        # The worst possible controller: immediate game over
         worst_reward = np.sum(ep_loads) * ep_marginal_cost
-        best_reward = np.sum(ep_losses) * min_losses_ratio
+
+        # Do nothing: the baseline
         zero_reward = ep_do_nothing_reward
         zero_blackout = ep_loads[ep_dn_played:]
         zero_reward += np.sum(zero_blackout) * ep_marginal_cost
+
+         # No game over reward
         nodisc_reward = ep_do_nothing_nodisc_reward
+
+        # No Game Over + loss optim: is a controller that does better than the previous one in the sense that it
+        # will also take care (and succeed) in managing the losses. To make sure we have an upper bound on it, we
+        # suppose that such a controller is 20% more efficient than the "No Game Over" controller in reducing the
+        # operational cost. [NB for most scenarios, this is probably out of reach]
+        min_losses_ratio = 0.8
+        best_reward = np.sum(ep_losses) * min_losses_ratio
 
         # Linear interp episode reward to codalab score
         if zero_reward != nodisc_reward:
@@ -82,10 +104,12 @@ class TrainAgent(object):
             reward_range = [best_reward, zero_reward, worst_reward]
             score_range = [100.0, 0.0, -100.0]
 
-        ep_score = np.interp(agent_reward, reward_range, score_range)
+        ep_score = np.interp(agent_costs, reward_range, score_range)
         return ep_score
 
     def interaction(self, obs, prev_act, start_step):
+        # This interaction function was used by the SMAAC agent. However, this one always starts with changing the
+        # config of the graph. Therefore, a new interaction function is used by all agents in the MARL paper.
         self.agent.save_start_transition()
         # order = None if self.agent.order is None else self.agent.order.clone()
         reward, train_reward, step = 0, 0, 0
@@ -154,6 +178,7 @@ class TrainAgent(object):
         max_ffw,
         best_score=-100,
         verbose=True,
+        use_prio=True,
     ):
         if verbose:
             print(
@@ -183,9 +208,14 @@ class TrainAgent(object):
                     ["env_interactions"] + [f"score_chron{chron}_{ffw}" for chron, ffw in valid_chron_ffw.items()]
                 )
 
-        for i in range(total_chronic_num):
-            cid, fw = train_chronics_ffw[i]
-            chronic_records[i] = self.chronic_priority(cid, fw, 1)
+        if self.test_full:
+            with open(os.path.join(output_dir, "full_score.csv"), "a", newline="") as cf:
+                csv.writer(cf).writerow(["env_interactions"] + [f"Score_Ch{chron}" for chron in self.test_chron])
+
+        if use_prio:
+            for i in range(total_chronic_num):
+                cid, fw = train_chronics_ffw[i]
+                chronic_records[i] = self.chronic_priority(cid, fw, 1)
 
         update_pbar = nb_frame / 100
         
@@ -277,9 +307,11 @@ class TrainAgent(object):
                     break
             if prune == 1:
                 break
-            # update chronic sampling weight
-            chronic_records[record_idx] = self.chronic_priority(chronic_id, ffw, alive_frame)
-            chronic_step_records[record_idx] = alive_frame
+            if use_prio:
+                # update chronic sampling weight
+                chronic_records[record_idx] = self.chronic_priority(chronic_id, ffw, alive_frame)
+                chronic_step_records[record_idx] = alive_frame
+
             if verbose and ((self.agent.agent_step - pbar.n) > update_pbar):
                 pbar.n = self.agent.agent_step
                 pbar.refresh()
@@ -306,7 +338,7 @@ class TrainAgent(object):
             self.last_number_updates = self.agent.update_step
             fill_outputs = True
             if type(self.agent) == ReArIMARL:
-                result, self.last_stats, self.last_scores, self.last_steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts, ra_action_counts = self.test(valid_chron_ffw, verbose)
+                result, self.last_stats, self.last_scores, self.last_steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts, ra_action_counts, clusters = self.test(valid_chron_ffw, verbose)
             else:
                 result, self.last_stats, self.last_scores, self.last_steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts = self.test(valid_chron_ffw, verbose)
             
@@ -320,6 +352,15 @@ class TrainAgent(object):
         if verbose:
             print(f"[{eval_iter:4d}] Valid: score {self.last_stats['score']} | step {self.last_stats['step']}")
 
+        if self.test_full:
+            # do a full episode evaluation:
+            stats_full, self.last_scores_full, ts_survived = self.test_full_episodes()
+            if verbose:
+                print(
+                    f"-------------------------------------------------------------------\n"
+                    f"L2RPN2023 Validation: score {stats_full['score']} | step {stats_full['step']}\n"
+                )
+
         # New directory for the training measurements
         train_dir = os.path.join(output_dir, "train_measures")
 
@@ -328,6 +369,11 @@ class TrainAgent(object):
             csv.writer(cf).writerow([self.agent.agent_step] + self.last_scores)
         with open(os.path.join(output_dir, "step.csv"), "a", newline="") as cf:
             csv.writer(cf).writerow(self.last_steps)
+        if self.test_full:
+            with open(os.path.join(output_dir, "full_score.csv"), "a", newline="") as cf:
+                csv.writer(cf).writerow([self.agent.agent_step] + self.last_scores_full)
+            with open(os.path.join(output_dir, "full_steps.csv"), "a", newline="") as cf:
+                csv.writer(cf).writerow(ts_survived)
 
         # Measures are computed only if the agent is updated (it will usually be the case, but not for short fast runs)
         if fill_outputs:
@@ -348,21 +394,23 @@ class TrainAgent(object):
 
                 if type(self.agent) == ReArIMARL:
                     write_ra_action_counts_to_csv(os.path.join(train_dir, f"ra_action_counts_{self.agent.agent_step}.csv"), ra_action_counts)
-                
+                    with open(os.path.join(output_dir, "clusters.csv"), "a", newline="") as cf:
+                        csv.writer(cf).writerow(clusters)
                 # Compute and write summary measures
                 #compute_per_chronic_measures(train_dir, valid_chron_ffw, self.agent.agent_step)
                 #compute_across_chronic_measures(train_dir, valid_chron_ffw, self.agent.agent_step)
             
         return best_score, self.last_stats["score"]
 
-    def test(self, chron_ffw, verbose=True):
+    def test(self, chron_valid, verbose=True):
         result, sub_depth, elem_depth, topologies, is_safe, unique_topos_total, substation_configs = {}, {}, {}, {}, {}, {}, {}
         steps, scores, unique_topos = [], [], []
-        action_counts = {chron_id: {sub: 0 for sub in self.agent.action_converter.masked_sorted_sub} for chron_id in chron_ffw}
-        reconnections = 0
+        actioncv = self.agent.action_converter
+        action_counts = {chron_id: {sub: 0 for sub in actioncv.masked_sorted_sub} for chron_id in chron_valid}
         if type(self.agent) == ReArIMARL:
-                ra_action_counts = {chron_id: {ra: 0 for ra in self.agent.action_converter.ra_idx} for chron_id in chron_ffw}
-        steps_overloaded = {chron_id: {0.9: 0, 0.95: 0, 0.96: 0, 0.98: 0, 0.99: 0, 1: 0} for chron_id in chron_ffw}
+                ra_action_counts = {chron_id: {ra: 0 for ra in actioncv.ra_idx} for chron_id in chron_valid}
+                clusters = actioncv.masked_clusters
+        steps_overloaded = {chron_id: {0.9: 0, 0.95: 0, 0.96: 0, 0.98: 0, 0.99: 0, 1: 0} for chron_id in chron_valid}
         
         def get_topo_id(topo_vect):
             subs_with_2 = [f"sub{sub}" for sub in self.agent.action_converter.masked_sorted_sub if np.any(topo_vect[self.begin[sub]:self.end[sub]] == 2)]
@@ -373,14 +421,14 @@ class TrainAgent(object):
 
         if verbose:
             print("\n")
-        for i in chron_ffw:
+        for i in chron_valid:
             self.test_env.seed(59)
             obs = self.test_env.reset()
             cur_chron = int(self.test_env.chronics_handler.get_name())
-            if len(chron_ffw) == 5:
+            if len(chron_valid) == 5:
                 ffw = i
             else:
-                ffw = chron_ffw[cur_chron]
+                ffw = chron_valid[cur_chron]
             dn_step = self.dn_ffw[(cur_chron, ffw)][0]
 
             self.agent.reset(obs)
@@ -486,27 +534,48 @@ class TrainAgent(object):
             val_score += result[key]["reward"]
             val_rew += result[key]["real_reward"]
         stats = {
-            "step": val_step / len(chron_ffw),
-            "score": val_score / len(chron_ffw),
-            "reward": val_rew / len(chron_ffw),
+            "step": val_step / len(chron_valid),
+            "score": val_score / len(chron_valid),
+            "reward": val_rew / len(chron_valid),
             # 'alpha': self.agent.log_alpha.exp().item() # wont work for MA_SACD need other way to track alpha
         }
-        if len(chron_ffw) != 5:
+        if len(chron_valid) != 5:
             # correct order of scores since the chronics picked are one later.
             scores.insert(0, scores.pop())
 
         if type(self.agent) == ReArIMARL:
-            return result, stats, scores, steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts, ra_action_counts
+            return result, stats, scores, steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts, ra_action_counts, clusters
         else:
             return result, stats, scores, steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts
 
+    def test_full_episodes(self, verbose=True):
+            op_scores = []
+            print("\n-- Score full episode --")
+            name_chron = [os.path.basename(path) for path in self.test_env.chronics_handler.real_data.available_chronics()]
+            all_scores, ts_survived, total_ts = self.scores_2023.get(self.agent)
+            meta_data_dn = self.scores_2023.stat_dn.get_metadata()
+            for i, chron in enumerate(name_chron):
+                op_scores.append(all_scores[i][1])
+                if verbose:
+                    print(
+                        f"[L2RPN2023 Test Ch ({chron})] {ts_survived[i]:4d}/{total_ts[i]} ({meta_data_dn[f'{i}']['nb_step']:4d}) Operational Score:{all_scores[i][1]:9.4f}"
+                    )
+            stats = {
+                "step": sum(ts_survived) / len(name_chron),
+                "score": sum(op_scores) / len(name_chron),
+            }
+            return stats, op_scores, ts_survived
+
     def evaluate(self, chronics, max_ffw, path, sample=False):
+        print("chronics from evaluate", chronics)
         result, sub_depth, elem_depth, topologies, unique_topos_total, substation_configs, is_safe = {}, {}, {}, {}, {}, {}, {}
         steps, scores, unique_topos = [], [], []
-        action_counts = {chron_id: {sub: 0 for sub in self.agent.action_converter.masked_sorted_sub} for chron_id in chronics}
         reconnections = 0
+        actioncv = self.agent.action_converter
+        action_counts = {chron_id: {sub: 0 for sub in actioncv.masked_sorted_sub} for chron_id in chronics}
         if type(self.agent) == ReArIMARL:
-            ra_action_counts = {chron_id: {ra: 0 for ra in self.agent.action_converter.ra_idx} for chron_id in chronics}
+                ra_action_counts = {chron_id: {ra: 0 for ra in actioncv.ra_idx} for chron_id in chronics}
+                clusters = actioncv.masked_clusters
         steps_overloaded = {chron_id: {0.9: 0, 0.95: 0, 0.96: 0, 0.98: 0, 0.99: 0, 1: 0} for chron_id in chronics}
 
         def get_topo_id(topo_vect):
@@ -550,18 +619,9 @@ class TrainAgent(object):
             total_reward = 0
             alive_frame = 0
             done = False
-            # df_topo = pd.DataFrame(columns=['ts', 'safe', 'rho', 'topo', 'topo_goal',
-            #                                 'action_val', 'low_actions', 'curr_load', 'future_load',
-            #                                 'curr_gen', 'future_gen'])
-            # topo_changes = [np.array([])] * len(self.agent.converter.sub_mask)
 
-            if 0:
-                topo_changes = np.array([obs.topo_vect[self.agent.action_converter.sub_mask]])
-            else:
-                topo_changes = np.array([obs.topo_vect])
+            topo_changes = np.array([obs.topo_vect])
 
-            # goals = None
-            # inputs = None
             safe = np.array([1])
 
             result[(chron_id, ffw)] = {}
@@ -569,7 +629,7 @@ class TrainAgent(object):
             is_safe[(chron_id, 0)] = self.agent.is_safe(obs)
             topologies[(chron_id, 0)] = obs.topo_vect.copy()
             unique_ts = np.array([obs.topo_vect])
-            
+
             while not done:
                 for threshold in steps_overloaded[chron_id]:
                     if max(obs.rho) >= threshold:
@@ -579,7 +639,7 @@ class TrainAgent(object):
                 bus_goal = act.set_bus if act != self.agent.action_space() else obs.topo_vect
                 prev_topo = obs.topo_vect
                 prev_step = alive_frame
-                
+
                 if act != self.agent.action_space() and act != self.agent.reconnect_line(obs):
                     if type(self.agent) == ReArIMARL:
                         ra_action_counts[chron_id][self.agent.action_converter.current_ra] += 1
@@ -589,10 +649,10 @@ class TrainAgent(object):
                             action_counts[chron_id][sub] += 1
                             acted_sub = sub
                             break
-                    print("action at step", alive_frame, "affecting substation", acted_sub)
+                    # print("action at step", alive_frame, "affecting substation", acted_sub)
                 elif act == self.agent.reconnect_line(obs):
                     reconnections += 1
-                    print("reconnection at step", alive_frame)
+                    # print("reconnection at step", alive_frame)
 
                 if not np.any(np.all(unique_ts == prev_topo, axis=1)) and np.all(obs.topo_vect != -1) and not done:
                     unique_ts = np.vstack((unique_ts, prev_topo))
@@ -682,7 +742,7 @@ class TrainAgent(object):
             "reward": val_rew / len(chronics),
         }
         if type(self.agent) == ReArIMARL:
-            return stats, scores, steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts, ra_action_counts
+            return stats, scores, steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts, ra_action_counts, clusters
         else:
             return stats, scores, steps, topologies, unique_topos, unique_topos_total, substation_configs, is_safe, steps_overloaded, sub_depth, elem_depth, action_counts
 
@@ -780,11 +840,6 @@ class Train(TrainAgent):
                     break
                 elif skip:
                     skip = False
-
-            # debugging info
-            # print("printing from train.interaction", ", step: ", step)
-            # print(act)
-
             train_reward = np.clip(train_reward, -2, self.max_rw)
             die = bool(done and info["exception"])
             self.agent.save_transition(train_reward, die, n_step=step)
@@ -794,6 +849,211 @@ class Train(TrainAgent):
             infos = (start_step, prev_act, info, interacted)
         return obs, reward, done, infos
 
+class TrainFull(TrainAgent):
+    def __init__(self, agent, env, test_env, dn_ffw, ep_infos, max_reward=10, rw_func="loss", test_full=True):
+        super().__init__(agent, env, test_env, dn_ffw, ep_infos, max_reward=max_reward, rw_func=rw_func, test_full=True)
+        self.ffw_size = 288
+
+    def train(
+        self,
+        seed,
+        nb_frame,
+        test_step,
+        train_chronics,
+        valid_chronics,
+        output_dir,
+        model_path,
+        max_ffw,
+        best_score=-100,
+        verbose=True,
+        use_prio=True,
+    ):
+        if verbose:
+            print(
+                " ****************************** \n"
+                " ***  START TRAINING AGENT  *** \n"
+                " ****************************** \n"
+            )
+
+        # initialize training chronic sampling weights
+        max_ffw = self.env.max_episode_duration() // 288
+        chron_scores = torch.ones(len(train_chronics), max_ffw) * 2.0
+
+        # for each test chronic create column to save evaluation during training
+        with open(os.path.join(output_dir, "full_score.csv"), "a", newline="") as cf:
+            csv.writer(cf).writerow(["Env_Interactions"] + [f"Score_Ch{chron}" for chron in self.test_chron])
+
+        update_pbar = nb_frame / 100
+
+        # evaluate initial start of the agent
+        best_score, prune = self.test_train(output_dir, model_path, best_score, verbose)
+
+        tic = datetime.now()
+        if verbose:
+            pbar = tqdm(
+                desc="Progress training agent for %g timesteps" % nb_frame, total=nb_frame, position=0, leave=True
+            )
+        else:
+            pbar = None
+        # training loop
+        while self.agent.agent_step < nb_frame:
+            if use_prio:
+                # sample training chronic
+                dist = torch.distributions.categorical.Categorical(logits=torch.Tensor(chron_scores.flatten()))
+                record_idx = dist.sample().item()
+                chronic_idx = record_idx // max_ffw
+                ffw = record_idx % max_ffw
+                self.env.set_id(
+                    chronic_idx
+                )  # NOTE: this will take the previous chronic since with env.reset() you will get the next
+            obs = self.env.reset()
+            if use_prio:
+                if ffw > 0:
+                    self.env.fast_forward_chronics(ffw * self.ffw_size)
+                    obs, *_ = self.env.step(self.env.action_space())
+            done = False
+            alive_frame = 0
+
+            # update = False
+            self.agent.reset(obs)
+            prev_act = self.agent.act(obs, None, None)
+            while not done:
+                obs, reward, done, info = self.interaction(obs, prev_act, alive_frame)
+                alive_frame, prev_act = info[:2]
+                interacted = info[-1]
+                # total_reward += reward
+                # train_reward += info[0][3]
+
+                if self.agent.check_start_update():
+                    self.agent.update()
+
+                if (self.agent.agent_step % test_step == 0) & interacted:
+                    # start evaluation agent after test_step number of updates
+                    cache = self.agent.cache_stat()
+                    best_score, prune = self.test_train(output_dir, model_path, best_score, verbose)
+                    self.agent.load_cache_stat(cache)
+
+                    tic = datetime.now()
+
+                if self.agent.agent_step > nb_frame:
+                    break
+                if prune == 1:
+                    break
+            if prune == 1:
+                break
+
+            if use_prio:
+                # update chronic sampling weight
+                pieces_played = int(np.ceil(alive_frame / self.ffw_size))
+                chron_scores[chronic_idx][ffw : (ffw + pieces_played)] = self.chronic_prio(
+                    chronic_idx, ffw, alive_frame, pieces_played
+                )
+            if verbose and ((self.agent.agent_step - pbar.n) > update_pbar):
+                pbar.n = self.agent.agent_step
+                pbar.refresh()
+
+        if verbose:
+            self.agent.save_model(model_path, "last")
+            pbar.close()
+            print(f"\n__________________________________\n     Training is done:\n----------------------------------")
+            print(f"** Best score agent: {best_score:9.4f} **")
+            print(f"The agent did {self.agent.update_step} updates in total")
+            if isinstance(self.agent, IMARL):
+                self.agent.print_updates_per_agent()
+
+        return best_score
+
+    def test_train(self, output_dir, model_path, best_score, verbose=True):
+        # start evaluation agent after test_step number of updates
+        eval_iter = self.agent.agent_step  # // test_step
+        if (self.agent.update_step > self.last_number_updates) or (self.agent.update_step == 0):
+            self.last_number_updates = self.agent.update_step
+            # do a full episode evaluation:
+            stats_full, self.last_scores_full, self.last_steps = self.test_full_episodes()
+            if verbose:
+                print(
+                    f"-------------------------------------------------------------------\n"
+                    f"[{eval_iter:4d}] L2RPN2023 Validation: score {stats_full['score']} | step {stats_full['step']}\n"
+                )
+
+            if (best_score - 0.5) < stats_full["score"]:  # update also when score is almost as good as best
+                if verbose:
+                    print(f"Found score higher or similar to best, save agent!")
+                best_score = max(best_score, stats_full["score"])
+                self.agent.save_model(model_path, "best")
+                np.save(os.path.join(output_dir, f"best_score.npy"), best_score)
+        else:
+            stats_full = {"score": self.last_scores_full, "step": self.last_steps}
+
+        # log and save model
+        with open(os.path.join(output_dir, "step.csv"), "a", newline="") as cf:
+            csv.writer(cf).writerow(self.last_steps)
+        with open(os.path.join(output_dir, "full_score.csv"), "a", newline="") as cf:
+            csv.writer(cf).writerow([self.agent.agent_step] + self.last_scores_full)
+
+        return best_score, stats_full["score"]
+
+    def interaction(self, obs, prev_act, start_step):
+        act = prev_act
+        reward, done, step, info = 0, 0, 0, None
+        interacted = False
+        while (not self.agent.save) & (not done):
+            # action is do nothing OR reconnect line
+            obs, rew, done, info = self.env.step(act)
+            start_step += 1
+            # reward += rew
+            act = self.agent.act(obs, None, None)
+
+        if self.agent.save & (not done):
+            interacted = True
+            # agent.act() has generated a new action (goal)
+            self.agent.save_start_transition()
+            train_reward = 0
+            discount = 1
+            skip = False
+            if act == self.env.action_space():
+                if isinstance(self.agent, IMARL):
+                    # agent for this sub decided to keep topology config as is.
+                    skip = True
+                else:
+                    # agent does nothing while action should be taken.
+                    train_reward -= 1
+            while not done:
+                if skip:
+                    # train_reward += 0
+                    info = {"exception": False}
+                else:
+                    obs, rew, done, info = self.env.step(act)
+                    # reward += rew
+                    new_reward = info["rewards"][self.rw_func]
+                    train_reward += discount * new_reward
+                    step += 1
+                    discount *= self.agent.gamma
+                if done:
+                    break
+                act = self.agent.act(obs, None, None)
+                if self.agent.save or (train_reward > self.max_rw):
+                    # a new actions has been generated OR the env has been safe for a long time
+                    # pass this act to the next step.
+                    prev_act = act
+                    break
+                elif skip:
+                    skip = False
+            train_reward = np.clip(train_reward, -2, self.max_rw)
+            die = bool(done and info["exception"])
+            self.agent.save_transition(train_reward, die, n_step=step)
+            infos = (step + start_step, prev_act, info, interacted)
+        else:
+            done = True
+            infos = (start_step, prev_act, info, interacted)
+        return obs, reward, done, infos
+
+    def chronic_prio(self, cid, ffw, step, played_parts):
+        max_steps = self.env.max_episode_duration() - ffw * self.ffw_size
+        scores = torch.ones(played_parts) * 2.0  # scale = 2.0
+        for p in range(played_parts):
+            scores[p] *= 1 - np.sqrt((step - self.ffw_size * p) / (max_steps - self.ffw_size * p))
+        return scores
 
 class ParamTuningTrain(Train):
     """
